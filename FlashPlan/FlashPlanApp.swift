@@ -236,9 +236,9 @@ final class SessionStore: ObservableObject {
             let res = try await Auth.auth().createUser(withEmail: email, password: password)
             self.user = res.user
             if let email = res.user.email, !email.isEmpty {
-                           self.displayName = email.split(separator: "@").first.map(String.init) ?? "You"
-                       }
-                       try? await usersService.ensureUserDocument(uid: res.user.uid, displayName: displayName, email: res.user.email)
+                self.displayName = email.split(separator: "@").first.map(String.init) ?? "You"
+                            }
+                            try? await usersService.ensureUserDocument(uid: res.user.uid, displayName: displayName, email: res.user.email)
         } catch {
             self.authError = error.localizedDescription
         }
@@ -290,27 +290,27 @@ final class UsersService {
     /// Creates or updates a minimal user profile document so users can be linked to multiple groups.
     func ensureUserDocument(uid: String, displayName: String?, email: String?) async throws {
         let snapshot = try await userRef(uid).getDocument()
-                let isNewUser = !snapshot.exists
+        let isNewUser = !snapshot.exists
         var data: [String: Any] = [
             "updatedAt": Timestamp(date: Date())
         ]
         if isNewUser {
-                   data["createdAt"] = Timestamp(date: Date())
-               }
+            data["createdAt"] = Timestamp(date: Date())
+                    }
         if let displayName, !displayName.isEmpty { data["displayName"] = displayName }
         if let email, !email.isEmpty { data["email"] = email }
         try await userRef(uid).setData(data, merge: true)
     }
 
     func linkGroup(uid: String, groupId: String, role: String, groupName: String?) async throws {
-           var data: [String: Any] = [
+        var data: [String: Any] = [
             "role": role,
             "linkedAt": Timestamp(date: Date())
-           ]
-                   if let groupName, !groupName.isEmpty {
-                       data["groupName"] = groupName
-                   }
-                   try await userGroupsRef(uid).document(groupId).setData(data, merge: true)
+        ]
+                if let groupName, !groupName.isEmpty {
+                    data["groupName"] = groupName
+                }
+                try await userGroupsRef(uid).document(groupId).setData(data, merge: true)
     }
 
     func unlinkGroup(uid: String, groupId: String) async throws {
@@ -979,9 +979,9 @@ final class GroupsService {
     private let db = Firestore.firestore()
     private let users = UsersService()
     private func fetchGroupName(_ groupId: String) async throws -> String? {
-           let snap = try await groupRef(groupId).getDocument()
-           return snap.data()?["name"] as? String
-       }
+        let snap = try await groupRef(groupId).getDocument()
+               return snap.data()?["name"] as? String
+           }
 
     func groupsQuery(for uid: String) -> Query {
         db.collection("groups")
@@ -1021,7 +1021,8 @@ final class GroupsService {
     }
 
     func joinGroup(groupId: String, uid: String, name: String) async throws {
-        let groupName = try await fetchGroupName(groupId)
+        func approveJoinRequest(groupId: String, uid: String, name: String) async throws {
+                let groupName = try await fetchGroupName(groupId)
         try await groupRef(groupId).updateData([
             "memberIds": FieldValue.arrayUnion([uid])
         ])
@@ -1030,7 +1031,7 @@ final class GroupsService {
             "joinedAt": Timestamp(date: Date()),
             "role": "member"
         ], merge: true)
-        try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
+            try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
     }
 
     func updateGroupTheme(groupId: String, themeKey: String) async throws {
@@ -1088,7 +1089,7 @@ final class GroupsService {
         try await groupRef(groupId).updateData([
             "joinRequests": FieldValue.arrayRemove([uid])
         ])
-        // Optionally clean pending member stub
+        try await membersRef(groupId).document(uid).delete()
     }
 
     func removeMember(groupId: String, uid: String) async throws {
@@ -1515,7 +1516,7 @@ struct GroupThemePicker: View {
     let onDone: () -> Void
 
     @Environment(AppThemeManager.self) private var theme
-    @Environment(\ .dismiss) private var dismiss
+    @Environment(\.dismiss) private var dismiss
 
     @State private var selectedKey: String
     @State private var isSaving = false
