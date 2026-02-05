@@ -1537,32 +1537,7 @@ struct GroupThemePicker: View {
                         Button {
                             selectedKey = th.key
                         } label: {
-                            HStack(spacing: 12) {
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(th.gradient)
-                                    .frame(width: 44, height: 44)
-                                    .overlay(
-                                        Image(systemName: "paintbrush.fill")
-                                            .foregroundStyle(.white.opacity(0.9))
-                                    )
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(th.key.capitalized)
-                                        .font(.headline)
-                                    if th.key == selectedKey {
-                                        Text("Selected")
-                                            .font(.footnote)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                                if th.key == selectedKey {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .foregroundStyle(th.accent)
-                                } else {
-                                    Image(systemName: "circle")
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
+                            GroupThemeRow(theme: th, isSelected: th.key == selectedKey)
                             .padding(12)
                             .background(.ultraThinMaterial)
                             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -1606,6 +1581,40 @@ struct GroupThemePicker: View {
         }
     }
 }
+private struct GroupThemeRow: View {
+    let theme: AppTheme
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(theme.gradient)
+                .frame(width: 44, height: 44)
+                .overlay(
+                    Image(systemName: "paintbrush.fill")
+                        .foregroundStyle(.white.opacity(0.9))
+                )
+            VStack(alignment: .leading, spacing: 4) {
+                Text(theme.key.capitalized)
+                    .font(.headline)
+                if isSelected {
+                    Text("Selected")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if isSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(theme.accent)
+            } else {
+                Image(systemName: "circle")
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
 
 struct InviteCodeView: View {
     @EnvironmentObject var session: SessionStore
