@@ -54,6 +54,12 @@ struct FlashPlanApp: App {
     init() {
         // Configure Firebase before any Firebase APIs are used.
         FirebaseApp.configure()
+        if let app = FirebaseApp.app() {
+            let opts = app.options
+            print("[Firebase] Configured. projectID=\(opts.projectID ?? "nil"), appID=\(opts.googleAppID), gcmSenderID=\(opts.gcmSenderID)")
+        } else {
+            print("[Firebase] Configuration FAILED: FirebaseApp.app() is nil")
+        }
         // Initialize SessionStore after Firebase is configured.
         _session = StateObject(wrappedValue: SessionStore())
     }
@@ -208,6 +214,7 @@ final class SessionStore: ObservableObject {
     init() {
         handle = Auth.auth().addStateDidChangeListener { _, user in
             Task { @MainActor in
+                print("[Auth] State changed. user=\(user?.uid ?? "nil") email=\(user?.email ?? "nil")")
                 self.user = user
                 self.authError = nil
                 if let email = user?.email, !email.isEmpty {
@@ -216,7 +223,12 @@ final class SessionStore: ObservableObject {
                     self.displayName = "You"
                 }
                 if let user {
-                    try? await self.usersService.ensureUserDocument(uid: user.uid, displayName: self.displayName, email: user.email)
+                    do {
+                        try await self.usersService.ensureUserDocument(uid: user.uid, displayName: self.displayName, email: user.email)
+                        print("[Users] ensureUserDocument success for uid=\(user.uid)")
+                    } catch {
+                        print("[Users] ensureUserDocument error: \(error.localizedDescription)")
+                    }
                 }
             }
         }
@@ -226,8 +238,10 @@ final class SessionStore: ObservableObject {
         do {
             let res = try await Auth.auth().signIn(withEmail: email, password: password)
             self.user = res.user
+            print("[Auth] Sign in success uid=\(res.user.uid)")
         } catch {
             self.authError = error.localizedDescription
+            print("[Auth] Sign in failed: \(error.localizedDescription)")
         }
     }
 
@@ -235,12 +249,19 @@ final class SessionStore: ObservableObject {
         do {
             let res = try await Auth.auth().createUser(withEmail: email, password: password)
             self.user = res.user
+            print("[Auth] Sign up success uid=\(res.user.uid)")
             if let email = res.user.email, !email.isEmpty {
                 self.displayName = email.split(separator: "@").first.map(String.init) ?? "You"
-                            }
-                            try? await usersService.ensureUserDocument(uid: res.user.uid, displayName: displayName, email: res.user.email)
+            }
+            do {
+                try await usersService.ensureUserDocument(uid: res.user.uid, displayName: displayName, email: res.user.email)
+                print("[Users] ensureUserDocument success for uid=\(res.user.uid)")
+            } catch {
+                print("[Users] ensureUserDocument error: \(error.localizedDescription)")
+            }
         } catch {
             self.authError = error.localizedDescription
+            print("[Auth] Sign up failed: \(error.localizedDescription)")
         }
     }
 
@@ -248,8 +269,10 @@ final class SessionStore: ObservableObject {
         do {
             try Auth.auth().signOut()
             self.user = nil
+            print("[Auth] Signed out")
         } catch {
             self.authError = error.localizedDescription
+            print("[Auth] Sign out failed: \(error.localizedDescription)")
         }
     }
 }
@@ -289,16 +312,16 @@ final class UsersService {
 
     /// Creates or updates a minimal user profile document so users can be linked to multiple groups.
     func ensureUserDocument(uid: String, displayName: String?, email: String?) async throws {
-        let snapshot = try await userRef(uid).getDocument()
-        let isNewUser = !snapshot.exists
-        var data: [String: Any] = [
-            "updatedAt": Timestamp(date: Date())
-        ]
-        if isNewUser {
-            data["createdAt"] = Timestamp(date: Date())
-                    }
-        if let displayName, !displayName.isEmpty { data["displayName"] = displayName }
-        if let email, !email.isEmpty { data["email"] = email }
+        let data: [String: Any] = {
+            var d: [String: Any] = [
+                "updatedAt": FieldValue.serverTimestamp()
+            ]
+            if let displayName, !displayName.isEmpty { d["displayName"] = displayName }
+            if let email, !email.isEmpty { d["email"] = email }
+            // Set createdAt too; if the document exists this will update it, which is acceptable for our needs.
+            d["createdAt"] = FieldValue.serverTimestamp()
+            return d
+        }()
         try await userRef(uid).setData(data, merge: true)
     }
 
@@ -307,10 +330,10 @@ final class UsersService {
             "role": role,
             "linkedAt": Timestamp(date: Date())
         ]
-                if let groupName, !groupName.isEmpty {
-                    data["groupName"] = groupName
-                }
-                try await userGroupsRef(uid).document(groupId).setData(data, merge: true)
+        if let groupName, !groupName.isEmpty {
+            data["groupName"] = groupName
+        }
+        try await userGroupsRef(uid).document(groupId).setData(data, merge: true)
     }
 
     func unlinkGroup(uid: String, groupId: String) async throws {
@@ -334,6 +357,7 @@ final class PlansVM: ObservableObject {
             guard let self else { return }
             if let err = err {
                 self.error = err.localizedDescription
+                print("[Plans] Listener error: \(err.localizedDescription)")
                 return
             }
             let docs = snap?.documents ?? []
@@ -580,7 +604,10 @@ struct GroupDetailView: View {
                         Task {
                             do {
                                 try await vm.service.requestToJoin(groupId: groupId, uid: uid, name: session.displayName)
-                            } catch { }
+                                print("[Group] Request to join submitted")
+                            } catch {
+                                print("[Group] Request to join failed: \(error.localizedDescription)")
+                            }
                         }
                     } label: {
                         Text("Request to Join")
@@ -720,6 +747,75 @@ struct GroupDetailView: View {
     }
 }
 
+// Inserted PlansListView here:
+
+struct PlansListView: View {
+    @EnvironmentObject var session: SessionStore
+    @Environment(AppThemeManager.self) private var theme
+
+    @StateObject private var vm = PlansVM()
+    @State private var showCreate = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if vm.plans.isEmpty {
+                    Text("No plans yet. Tap + to create one.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(vm.plans) { plan in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(plan.title).font(.headline)
+                            HStack(spacing: 8) {
+                                Label {
+                                    Text(plan.when, style: .date)
+                                } icon: {
+                                    Image(systemName: "calendar")
+                                }
+                                Label(plan.location.isEmpty ? "TBD" : plan.location, systemImage: "mappin.and.ellipse")
+                            }
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 6)
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(theme.globalTheme.gradient.opacity(0.06))
+            .navigationTitle("Plans")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Sign Out") {
+                        session.signOut()
+                    }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button { showCreate = true } label: { Image(systemName: "plus.circle.fill") }
+                }
+            }
+            .tint(theme.globalTheme.accent)
+            .sheet(isPresented: $showCreate) {
+                CreatePlanView { title, when, location, notes in
+                    guard let uid = session.user?.uid else { return }
+                    Task {
+                        do {
+                            _ = try await vm.createPlan(title: title, when: when, location: location, notes: notes, uid: uid)
+                            print("[Plans] Create success")
+                            await MainActor.run { showCreate = false }
+                        } catch {
+                            print("[Plans] Create failed: \(error.localizedDescription)")
+                            await MainActor.run { showCreate = false }
+                        }
+                    }
+                }
+            }
+            .onAppear { vm.start() }
+            .onDisappear { vm.stop() }
+        }
+    }
+}
+
 // MARK: - Groups List View modification for CreateGroupView's new onCreate signature
 
 struct GroupsListView: View {
@@ -799,6 +895,11 @@ struct GroupsListView: View {
             }
             .navigationTitle("Groups")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Sign Out") {
+                        session.signOut()
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showCreate = true } label: { Image(systemName: "plus.circle.fill") }
                 }
@@ -811,6 +912,7 @@ struct GroupsListView: View {
                     Task {
                         do {
                             let newId = try await vm.createGroup(name: name, uid: uid, displayName: session.displayName)
+                            print("[Groups] Create success id=\(newId)")
                             await MainActor.run {
                                 pendingNavGroupId = newId
                                 deepLinkActive = true
@@ -818,6 +920,7 @@ struct GroupsListView: View {
                                 done()
                             }
                         } catch {
+                            print("[Groups] Create failed: \(error.localizedDescription)")
                             await MainActor.run { done() }
                             // handle error minimally if desired
                         }
@@ -980,8 +1083,8 @@ final class GroupsService {
     private let users = UsersService()
     private func fetchGroupName(_ groupId: String) async throws -> String? {
         let snap = try await groupRef(groupId).getDocument()
-               return snap.data()?["name"] as? String
-           }
+        return snap.data()?["name"] as? String
+    }
 
     func groupsQuery(for uid: String) -> Query {
         db.collection("groups")
@@ -1021,8 +1124,6 @@ final class GroupsService {
     }
 
     func joinGroup(groupId: String, uid: String, name: String) async throws {
-        func approveJoinRequest(groupId: String, uid: String, name: String) async throws {
-                let groupName = try await fetchGroupName(groupId)
         try await groupRef(groupId).updateData([
             "memberIds": FieldValue.arrayUnion([uid])
         ])
@@ -1031,7 +1132,8 @@ final class GroupsService {
             "joinedAt": Timestamp(date: Date()),
             "role": "member"
         ], merge: true)
-            try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
+        let groupName = try await fetchGroupName(groupId)
+        try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
     }
 
     func updateGroupTheme(groupId: String, themeKey: String) async throws {
@@ -1064,7 +1166,6 @@ final class GroupsService {
         try await groupRef(groupId).updateData([
             "joinRequests": FieldValue.arrayUnion([uid])
         ])
-        // keep a minimal member doc stub for visibility if needed
         try await membersRef(groupId).document(uid).setData([
             "name": name,
             "joinedAt": Timestamp(date: Date()),
@@ -1072,7 +1173,8 @@ final class GroupsService {
         ], merge: true)
     }
 
-    let groupName = try await fetchGroupName(groupId)
+    func approveJoinRequest(groupId: String, uid: String, name: String) async throws {
+        let groupName = try await fetchGroupName(groupId)
         try await groupRef(groupId).updateData([
             "joinRequests": FieldValue.arrayRemove([uid]),
             "memberIds": FieldValue.arrayUnion([uid])
@@ -1082,7 +1184,7 @@ final class GroupsService {
             "joinedAt": Timestamp(date: Date()),
             "role": "member"
         ], merge: true)
-    try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
+        try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
     }
 
     func denyJoinRequest(groupId: String, uid: String) async throws {
@@ -1124,8 +1226,6 @@ final class GroupsService {
         try await users.linkGroup(uid: uid, groupId: groupId, role: "member", groupName: groupName)
     }
 
-    // Added availability helpers:
-
     func availabilityRef(_ groupId: String) -> CollectionReference {
         db.collection("groups").document(groupId).collection("availability")
     }
@@ -1152,7 +1252,11 @@ final class GroupsVM: ObservableObject {
         listener?.remove()
         listener = service.groupsQuery(for: uid).addSnapshotListener { [weak self] snap, err in
             guard let self else { return }
-            if let err = err { self.error = err.localizedDescription; return }
+            if let err = err {
+                self.error = err.localizedDescription
+                print("[Groups] Listener error: \(err.localizedDescription)")
+                return
+            }
             let docs = snap?.documents ?? []
             self.groups = docs.map { Group(id: $0.documentID, data: $0.data()) }
         }
@@ -1188,20 +1292,32 @@ final class GroupDetailVM: ObservableObject {
         stop()
         groupListener = service.groupRef(groupId).addSnapshotListener { [weak self] snap, err in
             guard let self else { return }
-            if let err = err { self.error = err.localizedDescription; return }
+            if let err = err {
+                self.error = err.localizedDescription
+                print("[Group] Listener error (group): \(err.localizedDescription)")
+                return
+            }
             guard let data = snap?.data() else { return }
             self.group = Group(id: groupId, data: data)
         }
         membersListener = service.membersRef(groupId).addSnapshotListener { [weak self] snap, err in
             guard let self else { return }
-            if let err = err { self.error = err.localizedDescription; return }
+            if let err = err {
+                self.error = err.localizedDescription
+                print("[Group] Listener error (members): \(err.localizedDescription)")
+                return
+            }
             let docs = snap?.documents ?? []
             self.members = docs.map { GroupMember(id: $0.documentID, data: $0.data()) }
         }
         // Added availability listener setup
         availabilityListener = service.availabilityRef(groupId).addSnapshotListener { [weak self] snap, err in
             guard let self else { return }
-            if let err = err { self.error = err.localizedDescription; return }
+            if let err = err {
+                self.error = err.localizedDescription
+                print("[Group] Listener error (availability): \(err.localizedDescription)")
+                return
+            }
             let docs = snap?.documents ?? []
             self.availability = docs.map { GroupAvailability(id: $0.documentID, data: $0.data()) }
         }
@@ -1364,7 +1480,18 @@ struct RootView: View {
     var body: some View {
         SwiftUI.Group {
             if session.user != nil {
-                GroupsListView()
+                TabView {
+                    PlansListView()
+                        .tabItem {
+                            Label("Plans", systemImage: "list.bullet.rectangle")
+                        }
+
+                    GroupsListView()
+                        .tabItem {
+                            Label("Groups", systemImage: "person.3")
+                        }
+                }
+                .tint(theme.globalTheme.accent)
             } else {
                 AuthView()
             }
@@ -1480,11 +1607,13 @@ struct GroupAvailabilityView: View {
                         Task {
                             do {
                                 try await vm.setMyAvailability(groupId: groupId, uid: uid, name: session.displayName, freeDates: freeDates)
+                                print("[Availability] Save success")
                                 await MainActor.run {
                                     isSaving = false
                                     dismiss()
                                 }
                             } catch {
+                                print("[Availability] Save failed: \(error.localizedDescription)")
                                 await MainActor.run { isSaving = false }
                             }
                         }
@@ -1645,11 +1774,13 @@ struct InviteCodeView: View {
                             Task {
                                 do {
                                     let newCode = try await vm.regenerateCode()
+                                    print("[Invite] Regenerated code: \(newCode)")
                                     await MainActor.run {
                                         localCode = newCode
                                         isWorking = false
                                     }
                                 } catch {
+                                    print("[Invite] Regenerate failed: \(error.localizedDescription)")
                                     await MainActor.run {
                                         isWorking = false
                                     }
@@ -1682,11 +1813,13 @@ struct InviteCodeView: View {
                             Task {
                                 do {
                                     try await vm.joinWithCode(code, uid: uid, name: session.displayName)
+                                    print("[Invite] Join with code success")
                                     await MainActor.run {
                                         isWorking = false
                                         onDismiss()
                                     }
                                 } catch {
+                                    print("[Invite] Join with code failed: \(error.localizedDescription)")
                                     await MainActor.run {
                                         isWorking = false
                                     }
@@ -1771,7 +1904,9 @@ struct RequestsView: View {
         defer { working.remove(uid) }
         do {
             try await vm.approve(uid: uid, name: name)
+            print("[Requests] Approved uid=\(uid)")
         } catch {
+            print("[Requests] Approve failed uid=\(uid): \(error.localizedDescription)")
             // Optionally handle error
         }
     }
@@ -1781,7 +1916,9 @@ struct RequestsView: View {
         defer { working.remove(uid) }
         do {
             try await vm.deny(uid: uid)
+            print("[Requests] Denied uid=\(uid)")
         } catch {
+            print("[Requests] Deny failed uid=\(uid): \(error.localizedDescription)")
             // Optionally handle error
         }
     }
