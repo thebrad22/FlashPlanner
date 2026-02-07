@@ -11,6 +11,7 @@ import FirebaseAuth
 import FirebaseFirestore
 import Combine
 import Observation
+import FirebaseDatabase
 
 // MARK: - App Links
 
@@ -18,13 +19,22 @@ enum AppLinks {
     // Reads a custom Info.plist key `AssociatedBaseURL` if present, otherwise falls back to a sensible default.
     // Example value: applinks:flashplan-e6166.web.app
     static var baseURL: URL {
-        if let raw = Bundle.main.object(forInfoDictionaryKey: "AssociatedBaseURL") as? String,
-           let url = URL(string: raw), url.scheme?.hasPrefix("http") == true {
-            return url
+        if let raw = Bundle.main.object(forInfoDictionaryKey: "AssociatedBaseURL") as? String {
+            // Normalize applinks: scheme to https:// for sharing and universal links
+            let normalized: String = {
+                if raw.lowercased().hasPrefix("applinks:") {
+                    let host = raw.dropFirst("applinks:".count)
+                    return "https://" + host
+                }
+                return raw
+            }()
+            if let url = URL(string: normalized), let scheme = url.scheme, scheme.hasPrefix("http") {
+                return url
+            }
         }
         // Fallback to the universal link domain you configured in Associated Domains.
-        // Replace this default if needed.
-        return URL(string: "https://flashplan.example")!
+        // Updated to use your actual Firebase Hosting domain.
+        return URL(string: "https://flashplan-e6166.web.app")!
     }
     
     static func planURL(id: String) -> URL { baseURL.appendingPathComponent("p").appendingPathComponent(id) }
@@ -245,17 +255,30 @@ final class SessionStore: ObservableObject {
         }
     }
 
-    func signUp(email: String, password: String) async {
+    func signUp(email: String, password: String, displayName: String) async {
         do {
             let res = try await Auth.auth().createUser(withEmail: email, password: password)
-            self.user = res.user
-            print("[Auth] Sign up success uid=\(res.user.uid)")
-            if let email = res.user.email, !email.isEmpty {
+            let user = res.user
+            // Update Firebase Auth profile display name
+            do {
+                let changeRequest = user.createProfileChangeRequest()
+                changeRequest.displayName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                try await changeRequest.commitChanges()
+            } catch {
+                print("[Auth] Failed to update displayName: \(error.localizedDescription)")
+            }
+            self.user = user
+            // Prefer the provided displayName, fallback to email prefix
+            let provided = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !provided.isEmpty {
+                self.displayName = provided
+            } else if let email = user.email, !email.isEmpty {
                 self.displayName = email.split(separator: "@").first.map(String.init) ?? "You"
             }
+            print("[Auth] Sign up success uid=\(user.uid)")
             do {
-                try await usersService.ensureUserDocument(uid: res.user.uid, displayName: displayName, email: res.user.email)
-                print("[Users] ensureUserDocument success for uid=\(res.user.uid)")
+                try await usersService.ensureUserDocument(uid: user.uid, displayName: self.displayName, email: user.email)
+                print("[Users] ensureUserDocument success for uid=\(user.uid)")
             } catch {
                 print("[Users] ensureUserDocument error: \(error.localizedDescription)")
             }
@@ -273,6 +296,42 @@ final class SessionStore: ObservableObject {
         } catch {
             self.authError = error.localizedDescription
             print("[Auth] Sign out failed: \(error.localizedDescription)")
+        }
+    }
+    
+    func updateContactInfo(displayName: String?, email: String?) async {
+        guard let user = Auth.auth().currentUser else { return }
+        do {
+            // Update display name if provided
+            if let dn = displayName?.trimmingCharacters(in: .whitespacesAndNewlines), !dn.isEmpty {
+                let change = user.createProfileChangeRequest()
+                change.displayName = dn
+                try await change.commitChanges()
+                await MainActor.run { self.displayName = dn }
+            }
+            // Update email if provided
+            if let e = email?.trimmingCharacters(in: .whitespacesAndNewlines), !e.isEmpty, e != user.email {
+                try await user.updateEmail(to: e)
+            }
+            try await usersService.ensureUserDocument(uid: user.uid, displayName: displayName, email: email)
+        } catch {
+            await MainActor.run { self.authError = error.localizedDescription }
+            print("[Account] Update contact info failed: \(error.localizedDescription)")
+        }
+    }
+
+    func deleteAccountPermanently() async {
+        guard let user = Auth.auth().currentUser else { return }
+        do {
+            // Best-effort: delete user profile document
+            do { try await usersService.userRef(user.uid).delete() } catch { }
+            // Delete Auth user
+            try await user.delete()
+            await MainActor.run { self.user = nil }
+            print("[Account] Account deleted")
+        } catch {
+            await MainActor.run { self.authError = error.localizedDescription }
+            print("[Account] Delete failed: \(error.localizedDescription)")
         }
     }
 }
@@ -295,6 +354,14 @@ final class PlansService {
     func votesRef(_ planId: String) -> CollectionReference {
         db.collection("plans").document(planId).collection("votes")
     }
+
+    func updatePlan(_ planId: String, fields: [String: Any]) async throws {
+        try await planRef(planId).updateData(fields)
+    }
+
+    func deletePlan(_ planId: String) async throws {
+        try await planRef(planId).delete()
+    }
 }
 
 // MARK: - Users Service
@@ -309,7 +376,17 @@ final class UsersService {
     func userGroupsRef(_ uid: String) -> CollectionReference {
         db.collection("users").document(uid).collection("groups")
     }
+    func userPlansRef(_ uid: String) -> CollectionReference {
+            db.collection("users").document(uid).collection("plans")
+        }
 
+        func userPlanVotesRef(_ uid: String) -> CollectionReference {
+            db.collection("users").document(uid).collection("planVotes")
+        }
+
+        func userAvailabilityRef(_ uid: String) -> CollectionReference {
+            db.collection("users").document(uid).collection("availability")
+        }
     /// Creates or updates a minimal user profile document so users can be linked to multiple groups.
     func ensureUserDocument(uid: String, displayName: String?, email: String?) async throws {
         let data: [String: Any] = {
@@ -339,6 +416,28 @@ final class UsersService {
     func unlinkGroup(uid: String, groupId: String) async throws {
         try await userGroupsRef(uid).document(groupId).delete()
     }
+    
+    func linkPlan(uid: String, planId: String, title: String, when: Date) async throws {
+        try await userPlansRef(uid).document(planId).setData([
+            "title": title,
+            "when": Timestamp(date: when),
+            "linkedAt": Timestamp(date: Date())
+        ], merge: true)
+    }
+
+    func recordPlanVote(uid: String, planId: String, vote: Vote) async throws {
+        try await userPlanVotesRef(uid).document(planId).setData([
+            "vote": vote.rawValue,
+            "updatedAt": Timestamp(date: Date())
+        ], merge: true)
+    }
+
+    func recordAvailability(uid: String, groupId: String, freeDates: Set<String>) async throws {
+        try await userAvailabilityRef(uid).document(groupId).setData([
+            "freeDates": Array(freeDates),
+            "updatedAt": Timestamp(date: Date())
+        ], merge: true)
+    }
 }
 
 // MARK: - ViewModels
@@ -349,6 +448,7 @@ final class PlansVM: ObservableObject {
     @Published var error: String?
 
     private let service = PlansService()
+    private let users = UsersService()
     private var listener: ListenerRegistration?
 
     func start() {
@@ -384,6 +484,7 @@ final class PlansVM: ObservableObject {
             ]
         )
         try await service.planRef(id).setData(plan.toFirestore)
+        try await users.linkPlan(uid: uid, planId: id, title: title, when: when)
         return id
     }
 }
@@ -395,6 +496,8 @@ final class PlanDetailVM: ObservableObject {
     @Published var error: String?
 
     private let service = PlansService()
+    private let users = UsersService()
+    
     private var planListener: ListenerRegistration?
     private var votesListener: ListenerRegistration?
 
@@ -430,6 +533,7 @@ final class PlanDetailVM: ObservableObject {
             "updatedAt": Timestamp(date: Date())
         ]
         try await service.votesRef(planId).document(uid).setData(data, merge: true)
+        try await users.recordPlanVote(uid: uid, planId: planId, vote: vote)
     }
 
     func counts() -> (yes: Int, maybe: Int, no: Int) {
@@ -482,6 +586,7 @@ struct CreatePlanView: View {
                         .lineLimit(3, reservesSpace: true)
                 }
             }
+            .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .tint(theme.globalTheme.accent)
             .navigationTitle("New Plan")
@@ -520,6 +625,7 @@ struct CreateGroupView: View {
             Form {
                 TextField("Group name", text: $name)
             }
+            .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .tint(theme.globalTheme.accent)
             .navigationTitle("New Group")
@@ -559,113 +665,21 @@ struct GroupDetailView: View {
 
     private var inviteURL: URL { AppLinks.groupURL(id: groupId) }
 
-    var body: some View {
-        let currentTheme = theme.themeForGroup(key: vm.group?.themeKey)
+    private var currentTheme: AppTheme { theme.themeForGroup(key: vm.group?.themeKey) }
 
+    var body: some View {
         VStack(spacing: 12) {
             if let group = vm.group {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(currentTheme.gradient)
-                        .opacity(0.35)
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 10) {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(currentTheme.gradient)
-                                .frame(width: 36, height: 36)
-                                .overlay(Image(systemName: "person.3.fill").foregroundStyle(.white.opacity(0.9)))
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(group.name).font(.title3).bold()
-                                Text("Members: \(vm.members.count)").foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if let code = vm.group?.inviteCode {
-                                Text("Code: \(code)")
-                                    .font(.caption)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(.ultraThinMaterial)
-                                    .clipShape(Capsule())
-                            }
-                            Button { showShare = true } label: { Image(systemName: "square.and.arrow.up") }
-                                .buttonStyle(.borderedProminent)
-                                .tint(currentTheme.accent)
-                        }
-                    }
-                    .padding(16)
-                }
-                .socialCardStyle(theme: currentTheme)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal)
-
-                if let uid = session.user?.uid, !vm.isMember(uid: uid) {
-                    Button {
-                        guard let uid = session.user?.uid else { return }
-                        Task {
-                            do {
-                                try await vm.service.requestToJoin(groupId: groupId, uid: uid, name: session.displayName)
-                                print("[Group] Request to join submitted")
-                            } catch {
-                                print("[Group] Request to join failed: \(error.localizedDescription)")
-                            }
-                        }
-                    } label: {
-                        Text("Request to Join")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
+                groupHeaderCard(theme: currentTheme)
+                GroupFreeCalendarView(membersCount: vm.members.count, availability: vm.availability)
                     .padding(.horizontal)
-                    .tint(currentTheme.accent)
-
-                    Button("Have a code? Enter it") {
-                        showInvite = true
-                    }
-                    .font(.footnote)
-                    .padding(.horizontal)
-                }
-
-                List {
-                    Section("Members") {
-                        if vm.members.isEmpty {
-                            Text("No members yet. Share the invite link.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(vm.members) { m in
-                                HStack(spacing: 12) {
-                                    AvatarView(name: m.name, size: 32)
-                                    VStack(alignment: .leading) {
-                                        Text(m.name)
-                                        if m.role == "owner" {
-                                            Text("Owner").font(.footnote).foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    Spacer()
-                                    if let me = session.user?.uid, vm.isAdmin(uid: me), m.id != me {
-                                        Menu {
-                                            if !(vm.group?.admins.contains(m.id) ?? false) {
-                                                Button("Promote to Admin") { Task { try? await vm.promote(uid: m.id) } }
-                                            } else {
-                                                Button("Demote from Admin", role: .destructive) { Task { try? await vm.demote(uid: m.id) } }
-                                            }
-                                            Button("Remove from Group", role: .destructive) { Task { try? await vm.remove(uid: m.id) } }
-                                        } label: {
-                                            Image(systemName: "ellipsis.circle")
-                                                .font(.title3)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                }
-                                .listRowSeparator(.hidden)
-                            }
-                        }
-                    }
-                    .listRowSeparator(.hidden)
-                }
-                .scrollContentBackground(.hidden)
+                nonMemberActions(theme: currentTheme)
+                membersList
             } else {
                 ProgressView("Loading…").padding()
             }
         }
+        .padding(.vertical, 8)
         .background(currentTheme.gradient.opacity(0.06))
         .navigationTitle("Group")
         .toolbar {
@@ -709,7 +723,18 @@ struct GroupDetailView: View {
             }
         }
         .sheet(isPresented: $showShare) {
-            ShareSheet(items: [inviteURL])
+            // Compose a friendly share message with link and invite code
+            let codeText: String = vm.group?.inviteCode ?? ""
+            let message: String = {
+                var parts: [String] = []
+                parts.append("Join our group on FlashPlan!")
+                if !codeText.isEmpty { parts.append("Invite Code: \(codeText)") }
+                parts.append("Link: \(inviteURL.absoluteString)")
+                parts.append("Download FlashPlan to join: https://flashplan-e6166.web.app")
+                return parts.joined(separator: "\n")
+            }()
+            // Share both the message text and the URL for rich previews
+            ShareSheet(items: [message, inviteURL])
         }
         .sheet(isPresented: $showTheme) {
             if let group = vm.group {
@@ -745,6 +770,119 @@ struct GroupDetailView: View {
             }
         }
     }
+
+    private func groupHeaderCard(theme currentTheme: AppTheme) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(currentTheme.gradient)
+                .opacity(0.35)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(currentTheme.gradient)
+                        .frame(width: 36, height: 36)
+                        .overlay(Image(systemName: "person.3.fill").foregroundStyle(.white.opacity(0.9)))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(vm.group?.name ?? "").font(.title3).bold()
+                        Text("Members: \(vm.members.count)").foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if let code = vm.group?.inviteCode {
+                        Text("Code: \(code)")
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.ultraThinMaterial)
+                            .clipShape(Capsule())
+                    }
+                    Button { showShare = true } label: { Image(systemName: "square.and.arrow.up") }
+                        .buttonStyle(.borderedProminent)
+                        .tint(currentTheme.accent)
+                }
+            }
+            .padding(16)
+        }
+        .socialCardStyle(theme: currentTheme)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+    }
+
+    @ViewBuilder
+    private func nonMemberActions(theme currentTheme: AppTheme) -> some View {
+        if let uid = session.user?.uid, !vm.isMember(uid: uid) {
+            Button {
+                guard let uid = session.user?.uid else { return }
+                Task {
+                    do {
+                        try await vm.service.requestToJoin(groupId: groupId, uid: uid, name: session.displayName)
+                        print("[Group] Request to join submitted")
+                    } catch {
+                        print("[Group] Request to join failed: \(error.localizedDescription)")
+                    }
+                }
+            } label: {
+                Text("Request to Join")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.horizontal)
+            .tint(currentTheme.accent)
+
+            Button("Have a code? Enter it") {
+                showInvite = true
+            }
+            .font(.footnote)
+            .padding(.horizontal)
+        } else {
+            EmptyView()
+        }
+    }
+
+    private var membersList: some View {
+        List {
+            Section("Members") {
+                if vm.members.isEmpty {
+                    Text("No members yet. Share the invite link.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(vm.members) { m in
+                        memberRow(m)
+                            .listRowSeparator(.hidden)
+                    }
+                }
+            }
+            .listRowSeparator(.hidden)
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    private func memberRow(_ m: GroupMember) -> some View {
+        HStack(spacing: 12) {
+            AvatarView(name: m.name, size: 32)
+            VStack(alignment: .leading) {
+                Text(m.name)
+                if m.role == "owner" {
+                    Text("Owner").font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            if let me = session.user?.uid, vm.isAdmin(uid: me), m.id != me {
+                Menu {
+                    if !(vm.group?.admins.contains(m.id) ?? false) {
+                        Button("Promote to Admin") { Task { try? await vm.promote(uid: m.id) } }
+                    } else {
+                        Button("Demote from Admin", role: .destructive) { Task { try? await vm.demote(uid: m.id) } }
+                    }
+                    Button("Remove from Group", role: .destructive) { Task { try? await vm.remove(uid: m.id) } }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
 }
 
 // Inserted PlansListView here:
@@ -764,23 +902,31 @@ struct PlansListView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(vm.plans) { plan in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(plan.title).font(.headline)
-                            HStack(spacing: 8) {
-                                Label {
-                                    Text(plan.when, style: .date)
-                                } icon: {
-                                    Image(systemName: "calendar")
+                        NavigationLink(destination: PlanEditorView(planId: plan.id)) {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(plan.title).font(.headline)
+                                HStack(spacing: 8) {
+                                    let dateText = Text(plan.when, style: .date)
+                                    Label { dateText } icon: { Image(systemName: "calendar") }
+                                    let locationText: String = plan.location.isEmpty ? "TBD" : plan.location
+                                    Label(locationText, systemImage: "mappin.and.ellipse")
                                 }
-                                Label(plan.location.isEmpty ? "TBD" : plan.location, systemImage: "mappin.and.ellipse")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
                             }
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 6)
+                            .padding(10)
+                            .background(.ultraThinMaterial)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                            )
                         }
-                        .padding(.vertical, 6)
                     }
                 }
             }
+            .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
             .background(theme.globalTheme.gradient.opacity(0.06))
             .navigationTitle("Plans")
@@ -816,6 +962,111 @@ struct PlansListView: View {
     }
 }
 
+struct PlanEditorView: View {
+    let planId: String
+
+    @EnvironmentObject var session: SessionStore
+    @Environment(AppThemeManager.self) private var theme
+    @Environment(\.dismiss) private var dismiss
+
+    @StateObject private var vm = PlanDetailVM()
+    @State private var title: String = ""
+    @State private var when: Date = Date()
+    @State private var location: String = ""
+    @State private var notes: String = ""
+    @State private var isWorking = false
+
+    private func loadFields() {
+        if let p = vm.plan {
+            title = p.title
+            when = p.when
+            location = p.location
+            notes = p.notes
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Title") {
+                    TextField("Title", text: $title)
+                }
+                Section("When") {
+                    DatePicker("Date & Time", selection: $when, displayedComponents: [.date, .hourAndMinute])
+                }
+                Section("Details") {
+                    TextField("Location", text: $location)
+                    TextField("Notes", text: $notes, axis: .vertical)
+                        .lineLimit(3, reservesSpace: true)
+                }
+                if let counts = Optional(vm.counts()), vm.plan != nil {
+                    Section("Votes") {
+                        HStack { CountPill(icon: "checkmark.circle", label: "Yes", count: counts.yes) }
+                        HStack { CountPill(icon: "questionmark.circle", label: "Maybe", count: counts.maybe) }
+                        HStack { CountPill(icon: "xmark.circle", label: "No", count: counts.no) }
+                    }
+                }
+                Section {
+                    Button(role: .destructive) {
+                        guard !isWorking else { return }
+                        isWorking = true
+                        Task {
+                            do {
+                                try await PlansService().deletePlan(planId)
+                                print("[Plan] Deleted id=\(planId)")
+                                await MainActor.run { dismiss() }
+                            } catch {
+                                print("[Plan] Delete failed: \(error.localizedDescription)")
+                                await MainActor.run { isWorking = false }
+                            }
+                        }
+                    } label: {
+                        Text("Delete Plan")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.globalTheme.gradient.opacity(0.06))
+            .tint(theme.globalTheme.accent)
+            .navigationTitle("Edit Plan")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(isWorking ? "Saving…" : "Save") {
+                        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard let p = vm.plan, !t.isEmpty else { return }
+                        isWorking = true
+                        Task {
+                            do {
+                                try await PlansService().updatePlan(p.id, fields: [
+                                    "title": t,
+                                    "when": Timestamp(date: when),
+                                    "location": location.trimmingCharacters(in: .whitespacesAndNewlines),
+                                    "notes": notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                                ])
+                                print("[Plan] Update success id=\(p.id)")
+                                await MainActor.run { isWorking = false }
+                            } catch {
+                                print("[Plan] Update failed: \(error.localizedDescription)")
+                                await MainActor.run { isWorking = false }
+                            }
+                        }
+                    }
+                    .disabled(isWorking || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.plan == nil)
+                }
+            }
+            .onAppear {
+                vm.start(planId: planId)
+            }
+            .onChange(of: vm.plan?.id) { _, _ in
+                loadFields()
+            }
+            .onDisappear { vm.stop() }
+        }
+    }
+}
+
 // MARK: - Groups List View modification for CreateGroupView's new onCreate signature
 
 struct GroupsListView: View {
@@ -845,7 +1096,10 @@ struct GroupsListView: View {
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button { showCreate = true } label: {
+                            Button {
+                                print("[Groups] Plus tapped (header)")
+                                showCreate = true
+                            } label: {
                                 Image(systemName: "plus.circle.fill").font(.title2)
                             }
                             .tint(theme.globalTheme.accent)
@@ -856,35 +1110,9 @@ struct GroupsListView: View {
 
                     LazyVStack(spacing: 14) {
                         ForEach(vm.groups) { group in
-                            NavigationLink(destination: GroupDetailView(groupId: group.id)) {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack(spacing: 10) {
-                                        RoundedRectangle(cornerRadius: 8)
-                                            .fill(theme.themeForGroup(key: group.themeKey).gradient)
-                                            .frame(width: 42, height: 42)
-                                            .overlay(
-                                                Image(systemName: "person.3.fill")
-                                                    .foregroundStyle(.white.opacity(0.9))
-                                            )
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(group.name).font(.headline)
-                                            Text("Members: \(group.memberIds.count)")
-                                                .font(.subheadline)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                        Image(systemName: "chevron.right").foregroundStyle(.tertiary)
-                                    }
-                                }
-                                .padding(14)
-                                .background(.ultraThinMaterial)
-                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                        .stroke(theme.globalTheme.accent.opacity(0.15), lineWidth: 1)
-                                )
-                                .shadow(color: Color.black.opacity(0.05), radius: 8, x: 0, y: 4)
-                                .socialCardStyle(theme: theme.globalTheme)
+                            let groupId = group.id
+                            NavigationLink(destination: GroupDetailView(groupId: groupId)) {
+                                groupRow(group: group)
                             }
                             .buttonStyle(.plain)
                             .padding(.horizontal)
@@ -901,7 +1129,10 @@ struct GroupsListView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button { showCreate = true } label: { Image(systemName: "plus.circle.fill") }
+                    Button {
+                        print("[Groups] Plus tapped (toolbar)")
+                        showCreate = true
+                    } label: { Image(systemName: "plus.circle.fill") }
                 }
             }
             .background(theme.globalTheme.gradient.opacity(0.06))
@@ -915,22 +1146,27 @@ struct GroupsListView: View {
                             print("[Groups] Create success id=\(newId)")
                             await MainActor.run {
                                 pendingNavGroupId = newId
-                                deepLinkActive = true
                                 showCreate = false
                                 done()
                             }
                         } catch {
                             print("[Groups] Create failed: \(error.localizedDescription)")
                             await MainActor.run { done() }
-                            // handle error minimally if desired
                         }
                     }
                 }
             }
-            .navigationDestination(isPresented: $deepLinkActive) {
+            .overlay(alignment: .center) {
                 if let id = pendingNavGroupId {
-                    GroupDetailView(groupId: id)
+                    NavigationLink(value: id) { EmptyView() }
+                        .frame(width: 0, height: 0)
+                        .hidden()
+                        .allowsHitTesting(false)
+                        .onAppear { deepLinkActive = false }
                 }
+            }
+            .navigationDestination(for: String.self) { id in
+                GroupDetailView(groupId: id)
             }
             .onAppear {
                 if let uid = session.user?.uid {
@@ -938,14 +1174,400 @@ struct GroupsListView: View {
                 }
                 if let id = router.consumePendingGroupId() {
                     pendingNavGroupId = id
-                    deepLinkActive = true
                 }
             }
             .onChange(of: router.pendingGroupId) { _, _ in
                 if let id = router.consumePendingGroupId() {
                     pendingNavGroupId = id
-                    deepLinkActive = true
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func groupRow(group: Group) -> some View {
+        let currentTheme = theme.themeForGroup(key: group.themeKey)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(currentTheme.gradient)
+                    .frame(width: 42, height: 42)
+                    .overlay(
+                        Image(systemName: "person.3.fill")
+                            .foregroundStyle(.white.opacity(0.9))
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(group.name).font(.headline)
+                    let membersText = "Members: " + String(group.memberIds.count)
+                    Text(membersText)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").foregroundStyle(.tertiary)
+            }
+        }
+        .padding(14)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(theme.globalTheme.accent.opacity(0.15), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.05), radius: 8, x: 0, y: 4)
+        .socialCardStyle(theme: theme.globalTheme)
+    }
+}
+
+// Added Calendar tab to RootView's TabView
+struct RootView: View {
+    @EnvironmentObject var session: SessionStore
+    @Environment(AppThemeManager.self) private var theme
+
+    var body: some View {
+        SwiftUI.Group {
+            if session.user != nil {
+                TabView {
+                    PlansListView()
+                        .tabItem {
+                            Label("Plans", systemImage: "list.bullet.rectangle")
+                        }
+
+                    GroupsListView()
+                        .tabItem {
+                            Label("Groups", systemImage: "person.3")
+                        }
+                    
+                    CalendarView()
+                        .tabItem {
+                            Label("Calendar", systemImage: "calendar")
+                        }
+                    
+                    AccountSettingsView()
+                        .tabItem {
+                            Label("Account", systemImage: "person.crop.circle")
+                        }
+                }
+                .tint(theme.globalTheme.accent)
+            } else {
+                AuthView()
+            }
+        }
+    }
+}
+
+// MARK: - Calendar (All Plans + Global Availability)
+
+@MainActor
+final class CalendarVM: ObservableObject {
+    @Published var plans: [Plan] = []
+    @Published var myGroups: [Group] = []
+    @Published var allAvailability: [GroupAvailability] = [] // union across groups
+    @Published var error: String?
+
+    private let plansService = PlansService()
+    private let groupsService = GroupsService()
+
+    private var plansListener: ListenerRegistration?
+    private var groupListener: ListenerRegistration?
+    private var availabilityListeners: [String: ListenerRegistration] = [:]
+
+    func start(uid: String) {
+        stop()
+        // Listen to all plans (existing query)
+        plansListener = plansService.plansQuery().addSnapshotListener { [weak self] snap, err in
+            guard let self else { return }
+            if let err = err { self.error = err.localizedDescription; return }
+            let docs = snap?.documents ?? []
+            self.plans = docs.map { Plan(id: $0.documentID, data: $0.data()) }
+        }
+        // Listen to groups the user belongs to
+        groupListener = groupsService.groupsQuery(for: uid).addSnapshotListener { [weak self] snap, err in
+            guard let self else { return }
+            if let err = err { self.error = err.localizedDescription; return }
+            let docs = snap?.documents ?? []
+            let groups = docs.map { Group(id: $0.documentID, data: $0.data()) }
+            self.myGroups = groups
+            // Rewire availability listeners per group
+            self.availabilityListeners.values.forEach { $0.remove() }
+            self.availabilityListeners.removeAll()
+            // Collect availability for all groups and merge
+            var combined: [String: GroupAvailability] = [:]
+            for g in groups {
+                let l = self.groupsService.availabilityRef(g.id).addSnapshotListener { [weak self] snap, err in
+                    guard let self else { return }
+                    if let err = err { self.error = err.localizedDescription; return }
+                    let docs = snap?.documents ?? []
+                    let avail = docs.map { GroupAvailability(id: $0.documentID, data: $0.data()) }
+                    // Merge into combined map by user id
+                    var map = combined
+                    for a in avail {
+                        if var existing = map[a.id] {
+                            existing = GroupAvailability(id: existing.id, data: [
+                                "name": existing.name,
+                                "freeDates": Array(existing.freeDates.union(a.freeDates))
+                            ])
+                            map[a.id] = existing
+                        } else {
+                            map[a.id] = a
+                        }
+                    }
+                    // Rebuild allAvailability from map
+                    self.allAvailability = Array(map.values)
+                }
+                self.availabilityListeners[g.id] = l
+            }
+        }
+    }
+
+    func stop() {
+        plansListener?.remove(); plansListener = nil
+        groupListener?.remove(); groupListener = nil
+        availabilityListeners.values.forEach { $0.remove() }
+        availabilityListeners.removeAll()
+    }
+
+    // Persist my free dates to all groups I'm in
+    func saveMyAvailabilityToAllGroups(uid: String, name: String, freeDates: Set<String>) async {
+        for g in myGroups {
+            do {
+                try await groupsService.setAvailability(groupId: g.id, uid: uid, name: name, freeDates: freeDates)
+            } catch {
+                // accumulate minimal error; continue best-effort
+                await MainActor.run { self.error = error.localizedDescription }
+            }
+        }
+    }
+
+    var topDates: [(date: Date, count: Int)] {
+        var counts: [String: Int] = [:]
+        for a in allAvailability {
+            for iso in a.freeDates { counts[iso, default: 0] += 1 }
+        }
+        var items: [(Date, Int)] = []
+        items.reserveCapacity(counts.count)
+        for (iso, c) in counts {
+            if let d = CalendarView.isoFormatter.date(from: iso) {
+                items.append((d, c))
+            }
+        }
+        items.sort { (lhs, rhs) -> Bool in
+            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            return lhs.0 < rhs.0
+        }
+        return items.map { (date: $0.0, count: $0.1) }
+    }
+}
+
+struct CalendarView: View {
+    @EnvironmentObject var session: SessionStore
+    @Environment(AppThemeManager.self) private var theme
+
+    @StateObject private var vm = CalendarVM()
+    @State private var selection: Set<DateComponents> = []
+    @State private var isSaving = false
+
+    // ISO yyyy-MM-dd formatter shared with availability views
+    fileprivate static let isoFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private func comps(from date: Date) -> DateComponents {
+        Calendar.current.dateComponents([.year, .month, .day], from: date)
+    }
+    private func date(from comps: DateComponents) -> Date? { Calendar.current.date(from: comps) }
+    private func iso(from comps: DateComponents) -> String? { guard let d = date(from: comps) else { return nil }; return Self.isoFormatter.string(from: d) }
+
+    // Plan dates for highlighting
+    private var planDates: Set<DateComponents> {
+        Set(vm.plans.map { comps(from: $0.when) })
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Calendar
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Your availability (all groups)")
+                            .font(.headline)
+                        Text("Pick the days you're free. We'll share them with each group you belong to.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal)
+
+                    MultiDatePicker("Select Dates", selection: $selection)
+                        .padding(.horizontal)
+                        .overlay(CalendarPlanLegend(accent: theme.globalTheme.accent))
+
+                    // Upcoming plans
+                    if !vm.plans.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Upcoming Plans")
+                                .font(.subheadline.bold())
+                                .padding(.horizontal)
+                            let sortedPlans: [Plan] = vm.plans.sorted { lhs, rhs in lhs.when < rhs.when }
+                            ForEach(sortedPlans) { plan in
+                                HStack {
+                                    VStack(alignment: .leading) {
+                                        Text(plan.title).font(.body)
+                                        HStack(spacing: 8) {
+                                            Image(systemName: "calendar").font(.caption)
+                                            Text(plan.when, style: .date)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if planDates.contains(comps(from: plan.when)) {
+                                        Image(systemName: "circle.fill")
+                                            .foregroundStyle(theme.globalTheme.accent)
+                                            .font(.caption2)
+                                    }
+                                }
+                                .padding(12)
+                                .background(.ultraThinMaterial)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                                )
+                                .padding(.horizontal)
+                            }
+                        }
+                    }
+
+                    // Top free dates across all groups
+                    if !vm.topDates.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Top Free Dates (All Groups)")
+                                .font(.subheadline.bold())
+                                .padding(.horizontal)
+                            let topItems: [(date: Date, count: Int)] = Array(vm.topDates.prefix(10))
+                            let enumeratedItems: [(offset: Int, element: (date: Date, count: Int))] = Array(topItems.enumerated())
+                            ForEach(enumeratedItems, id: \.offset) { item in
+                                let dateValue: Date = item.element.date
+                                let countValue: Int = item.element.count
+                                let countText: String = String(countValue) + " free"
+                                HStack {
+                                    Text(dateValue, style: .date)
+                                    Spacer()
+                                    Text(countText)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.horizontal)
+                                .padding(.vertical, 6)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical)
+            }
+            .background(theme.globalTheme.gradient.opacity(0.06))
+            .navigationTitle("Calendar")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(isSaving ? "Saving…" : "Save Availability") {
+                        guard let uid = session.user?.uid else { return }
+                        isSaving = true
+                        let freeDates: Set<String> = Set(selection.compactMap { iso(from: $0) })
+                        Task {
+                            await vm.saveMyAvailabilityToAllGroups(uid: uid, name: session.displayName, freeDates: freeDates)
+                            await MainActor.run { isSaving = false }
+                        }
+                    }
+                    .disabled(isSaving || session.user?.uid == nil)
+                }
+            }
+            .tint(theme.globalTheme.accent)
+            .themedToolbarBackground(theme.globalTheme)
+            .onAppear {
+                if let uid = session.user?.uid { vm.start(uid: uid) }
+            }
+            .onDisappear { vm.stop() }
+        }
+    }
+}
+
+struct CalendarPlanLegend: View {
+    let accent: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "circle.fill")
+                    .foregroundStyle(accent)
+                    .font(.caption2)
+                Text("Days with plans are highlighted in the list below.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.top, 220)
+    }
+}
+
+struct AccountSettingsView: View {
+    @EnvironmentObject var session: SessionStore
+    @Environment(AppThemeManager.self) private var theme
+
+    @State private var name: String = ""
+    @State private var email: String = ""
+    @State private var working: Bool = false
+    @State private var showDeleteConfirm: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Contact Information") {
+                    TextField("Name", text: $name)
+                    TextField("Email", text: $email)
+                        .textContentType(.emailAddress)
+                        .keyboardType(.emailAddress)
+                        .autocapitalization(.none)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button(working ? "Saving…" : "Save Changes") {
+                        working = true
+                        Task {
+                            await session.updateContactInfo(displayName: name, email: email)
+                            await MainActor.run { working = false }
+                        }
+                    }
+                    .disabled(working)
+                }
+
+                Section("Danger Zone") {
+                    Button(role: .destructive) {
+                        showDeleteConfirm = true
+                    } label: {
+                        Text("Delete Account")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .background(theme.globalTheme.gradient.opacity(0.06))
+            .tint(theme.globalTheme.accent)
+            .navigationTitle("Account")
+            .toolbar { }
+            .onAppear {
+                name = session.displayName
+                email = session.user?.email ?? ""
+            }
+            .alert("Delete Account?", isPresented: $showDeleteConfirm) {
+                Button("Delete", role: .destructive) {
+                    Task { await session.deleteAccountPermanently() }
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("This action will permanently delete your account and cannot be undone.")
             }
         }
     }
@@ -1235,6 +1857,7 @@ final class GroupsService {
             "name": name,
             "freeDates": Array(freeDates)
         ], merge: true)
+        try await users.recordAvailability(uid: uid, groupId: groupId, freeDates: freeDates)
     }
 }
 
@@ -1390,6 +2013,7 @@ struct AuthView: View {
     @EnvironmentObject var session: SessionStore
     @Environment(AppThemeManager.self) private var theme
 
+    @State private var name: String = ""
     @State private var email: String = ""
     @State private var password: String = ""
     @State private var isWorking: Bool = false
@@ -1408,6 +2032,14 @@ struct AuthView: View {
                 .padding(.bottom, 10)
 
                 VStack(spacing: 12) {
+                    if isSignUpMode {
+                        TextField("Name", text: $name)
+                            .textContentType(.name)
+                            .autocapitalization(.words)
+                            .padding(12)
+                            .background(.ultraThinMaterial)
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
                     TextField("Email", text: $email)
                         .textContentType(.emailAddress)
                         .keyboardType(.emailAddress)
@@ -1416,14 +2048,17 @@ struct AuthView: View {
                         .autocorrectionDisabled()
                         .padding(12)
                         .background(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
 
                     SecureField("Password", text: $password)
                         .textContentType(.password)
                         .padding(12)
                         .background(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 }
+                .padding(12)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .padding(.horizontal)
 
                 if let err = session.authError, !err.isEmpty {
@@ -1441,7 +2076,7 @@ struct AuthView: View {
                     Task {
                         do {
                             if isSignUpMode {
-                                await session.signUp(email: e, password: p)
+                                await session.signUp(email: e, password: p, displayName: name)
                             } else {
                                 await session.signIn(email: e, password: p)
                             }
@@ -1451,7 +2086,12 @@ struct AuthView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(theme.globalTheme.accent)
-                .disabled(isWorking || email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty)
+                .disabled(
+                    isWorking ||
+                    email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                    password.isEmpty ||
+                    (isSignUpMode && name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                )
                 .padding(.horizontal)
 
                 Button(isSignUpMode ? "Have an account? Sign In" : "New here? Create Account") {
@@ -1467,34 +2107,6 @@ struct AuthView: View {
             .background(theme.globalTheme.gradient.opacity(0.06))
             .navigationTitle(isSignUpMode ? "Create Account" : "Sign In")
             .toolbar { }
-        }
-    }
-}
-
-// MARK: - Root View (App entry content) modified as requested
-
-struct RootView: View {
-    @EnvironmentObject var session: SessionStore
-    @Environment(AppThemeManager.self) private var theme
-
-    var body: some View {
-        SwiftUI.Group {
-            if session.user != nil {
-                TabView {
-                    PlansListView()
-                        .tabItem {
-                            Label("Plans", systemImage: "list.bullet.rectangle")
-                        }
-
-                    GroupsListView()
-                        .tabItem {
-                            Label("Groups", systemImage: "person.3")
-                        }
-                }
-                .tint(theme.globalTheme.accent)
-            } else {
-                AuthView()
-            }
         }
     }
 }
@@ -1578,11 +2190,13 @@ struct GroupAvailabilityView: View {
                             Text("Top dates")
                                 .font(.subheadline.bold())
                                 .padding(.horizontal)
-                            ForEach(0..<min(10, topDates.count), id: \.self) { index in
+                            let items: [(id: String, date: Date, count: Int)] = Array(topDates.prefix(10))
+                            let enumeratedItems: [(offset: Int, element: (id: String, date: Date, count: Int))] = Array(items.enumerated())
+                            ForEach(enumeratedItems, id: \.offset) { item in
                                 HStack {
-                                    Text(topDates[index].date, style: .date)
+                                    Text(item.element.date, style: .date)
                                     Spacer()
-                                    Text("\(topDates[index].count) free")
+                                    Text("\(item.element.count) free")
                                         .foregroundStyle(.secondary)
                                 }
                                 .padding(.horizontal)
@@ -1635,6 +2249,152 @@ struct GroupAvailabilityView: View {
     }
 }
 
+// Inserted GroupFreeCalendarView here:
+
+struct GroupFreeCalendarView: View {
+    let membersCount: Int
+    let availability: [GroupAvailability]
+
+    @Environment(AppThemeManager.self) private var theme
+
+    // Reuse ISO formatter
+    private static let isoFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(secondsFromGMT: 0)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    @State private var dummySelection: Set<DateComponents> = [] // MultiDatePicker requires a binding
+
+    private func iso(from comps: DateComponents) -> String? {
+        guard let d = Calendar.current.date(from: comps) else { return nil }
+        return Self.isoFormatter.string(from: d)
+    }
+
+    private func components(from iso: String) -> DateComponents? {
+        guard let date = Self.isoFormatter.date(from: iso) else { return nil }
+        return Calendar.current.dateComponents([.year, .month, .day], from: date)
+    }
+
+    // Map of date components to count of free members
+    private var freeCounts: [DateComponents: Int] {
+        var counts: [DateComponents: Int] = [:]
+        for a in availability {
+            for iso in a.freeDates {
+                if let comps = components(from: iso) {
+                    counts[comps, default: 0] += 1
+                }
+            }
+        }
+        return counts
+    }
+
+    // Decide color for a given day
+    private func color(for comps: DateComponents) -> Color? {
+        guard membersCount > 0, let count = freeCounts[comps] else { return nil }
+        if count == membersCount {
+            return Color.green
+        }
+        if count * 2 > membersCount { // > 50%
+            return Color.blue
+        }
+        return nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Group Free Days")
+                .font(.headline)
+                .padding(.horizontal, 4)
+            MultiDatePicker("", selection: $dummySelection)
+                .overlay(
+                    GeometryReader { proxy in
+                        // We can't directly access day cells, so provide a legend instead
+                        // and keep the calendar context nearby. To visually indicate,
+                        // we provide a compact legend and rely on the list below for counts.
+                        Color.clear
+                    }
+                )
+            // Small legend
+            HStack(spacing: 12) {
+                HStack(spacing: 6) {
+                    Circle().fill(Color.green).frame(width: 10, height: 10)
+                    Text("Everyone free")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 6) {
+                    Circle().fill(Color.blue).frame(width: 10, height: 10)
+                    Text("> 50% free")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 4)
+
+            // Top free dates for this group
+            let itemsMap: [String: Int] = {
+                var map: [String: Int] = [:]
+                for a in availability {
+                    for iso in a.freeDates { map[iso, default: 0] += 1 }
+                }
+                return map
+            }()
+            let unsortedItems: [(date: Date, count: Int)] = itemsMap.compactMap { (iso, c) in
+                guard let d = Self.isoFormatter.date(from: iso) else { return nil }
+                return (date: d, count: c)
+            }
+            let items: [(date: Date, count: Int)] = unsortedItems.sorted { l, r in
+                if l.count != r.count { return l.count > r.count }
+                return l.date < r.date
+            }
+
+            if !items.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Best dates for this group")
+                        .font(.subheadline.bold())
+                    let topItems: [(date: Date, count: Int)] = Array(items.prefix(10))
+                    let enumeratedTopItems: [(offset: Int, element: (date: Date, count: Int))] = Array(topItems.enumerated())
+                    ForEach(enumeratedTopItems, id: \.offset) { item in
+                        HStack {
+                            Text(item.element.date, style: .date)
+                            Spacer()
+                            let c = item.element.count
+                            if membersCount > 0 && c == membersCount {
+                                Text("Everyone free")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            } else if membersCount > 0 && c * 2 > membersCount {
+                                Text("> 50% free")
+                                    .font(.caption)
+                                    .foregroundStyle(.blue)
+                            } else {
+                                Text("\(c)/\(membersCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            } else {
+                Text("No availability shared yet.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 8)
+        .background(theme.globalTheme.gradient.opacity(0.03))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+    }
+}
 
 // Assuming the added GroupThemePicker struct somewhere here:
 
@@ -1797,6 +2557,7 @@ struct InviteCodeView: View {
                     }
                 }
             }
+            .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .tint(theme.globalTheme.accent)
             .navigationTitle(isAdmin ? "Invite Code" : "Join with Code")
@@ -1884,6 +2645,7 @@ struct RequestsView: View {
                     ProgressView()
                 }
             }
+            .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
             .background(theme.globalTheme.gradient.opacity(0.06))
             .navigationTitle("Requests")
@@ -1923,4 +2685,7 @@ struct RequestsView: View {
         }
     }
 }
+
+
+
 

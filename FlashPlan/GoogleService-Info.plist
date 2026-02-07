@@ -26,5 +26,7 @@
 	<true/>
 	<key>GOOGLE_APP_ID</key>
 	<string>1:481338470966:ios:2cc0a6fb0e3428bf07de97</string>
+	<key>AssociatedBaseURL</key>
+	<string>applinks:flashplan-e6166.web.app</string>
 </dict>
 </plist>
