@@ -1,0 +1,12 @@
+# Xcode
+.DS_Store
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Internal generated workspace
+*.xcodeproj/project.xcworkspace/
+
+# SwiftPM
+.swiftpm/
+
